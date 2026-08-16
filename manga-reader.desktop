@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Manga Reader
+Comment=Lector local de manga
+Exec=manga-reader
+Icon=manga-reader-cat
+Terminal=false
+Categories=Graphics;Viewer;
+StartupNotify=true
+StartupWMClass=manga-reader
