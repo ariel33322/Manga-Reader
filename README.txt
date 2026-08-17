@@ -1,4 +1,4 @@
-MANGA READER 1.0.0-3
+MANGA READER 1.0.0-5
 =====================
 
 Esta es la versión SOLO MANGA.
