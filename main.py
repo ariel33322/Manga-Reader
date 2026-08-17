@@ -6,7 +6,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDir, QSettings, QStorageInfo, QSize
+from PySide6.QtCore import Qt, QDir, QSettings, QStorageInfo, QSize, QTimer
 from PySide6.QtGui import QCursor, QPixmap, QImage, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -4253,8 +4253,17 @@ class MangaCard(QFrame):
             manga[1]
         )
 
+        # Reservamos siempre el mismo espacio para el título.
+        # Así los nombres largos quedan centrados debajo de la portada
+        # en vez de pegarse a la parte superior de la tarjeta.
+        title.setFixedSize(
+            170,
+            48,
+        )
+
         title.setAlignment(
-            Qt.AlignCenter
+            Qt.AlignHCenter
+            | Qt.AlignVCenter
         )
 
         title.setWordWrap(
@@ -4919,7 +4928,19 @@ class MangaReader(QMainWindow):
 
         self.grid_widget.show()
 
-        columns = 5
+        # Número de columnas dinámico según el ancho real del lector.
+        # Antes estaba fijado en 5, por eso quedaba un espacio enorme
+        # a la derecha en pantallas anchas.
+        columns = self.calculate_grid_columns()
+
+        self._grid_columns = columns
+
+        # Distribuye las columnas a lo ancho del área disponible.
+        for column in range(20):
+            self.grid.setColumnStretch(
+                column,
+                1 if column < columns else 0,
+            )
 
         for index, (
             manga,
@@ -4936,7 +4957,81 @@ class MangaReader(QMainWindow):
                 card,
                 index // columns,
                 index % columns,
+                Qt.AlignTop
+                | Qt.AlignHCenter,
             )
+
+    def calculate_grid_columns(self):
+        """
+        Calcula cuántas tarjetas caben realmente en la biblioteca.
+        Cada tarjeta mide 190 px y dejamos margen para el espacio
+        horizontal configurado en el QGridLayout.
+        """
+        if not hasattr(
+            self,
+            "scroll",
+        ):
+            return 5
+
+        available_width = max(
+            190,
+            self.scroll.viewport().width()
+            - 16,
+        )
+
+        card_width = 190
+        spacing = 20
+
+        return max(
+            1,
+            int(
+                (available_width + spacing)
+                / (card_width + spacing)
+            ),
+        )
+
+    def resizeEvent(
+        self,
+        event,
+    ):
+        super().resizeEvent(
+            event
+        )
+
+        if not hasattr(
+            self,
+            "scroll",
+        ):
+            return
+
+        # Esperamos a que Qt termine de recalcular el viewport.
+        QTimer.singleShot(
+            0,
+            self.reflow_library_if_needed,
+        )
+
+    def reflow_library_if_needed(self):
+        if not hasattr(
+            self,
+            "grid",
+        ):
+            return
+
+        new_columns = (
+            self.calculate_grid_columns()
+        )
+
+        old_columns = getattr(
+            self,
+            "_grid_columns",
+            None,
+        )
+
+        if (
+            old_columns is not None
+            and new_columns != old_columns
+        ):
+            self.refresh_library()
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -5027,6 +5122,7 @@ class MangaReader(QMainWindow):
 
             #mangaTitle {
                 font-weight: bold;
+                qproperty-alignment: AlignCenter;
             }
 
             #continueLabel {
@@ -5055,8 +5151,6 @@ if __name__ == "__main__":
         sys.argv
     )
 
-    # Identidad de la aplicación para KDE / Plasma / Wayland.
-    # Debe coincidir con manga-reader.desktop.
     app.setApplicationName(
         "manga-reader"
     )
@@ -5069,7 +5163,6 @@ if __name__ == "__main__":
         "manga-reader"
     )
 
-    # En el paquete el icono se instala junto al código.
     local_icon = (
         Path(__file__).resolve().parent
         / "manga-reader-cat.png"

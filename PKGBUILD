@@ -1,10 +1,10 @@
 pkgname=manga-reader-local
 pkgver=1.0.0
-pkgrel=3
+pkgrel=5
 pkgdesc="Lector local de manga con biblioteca, progreso y soporte PDF/CBZ/ZIP"
 arch=('any')
-url="https://local.invalid/manga-reader"
-license=('custom')
+url="https://github.com/ariel33322/Manga-Reader"
+license=('MIT')
 depends=('python' 'pyside6')
 source=('main.py' 'manga-reader' 'manga-reader.desktop' 'manga-reader-cat.png')
 sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
