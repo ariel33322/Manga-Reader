@@ -29,7 +29,7 @@ INSTALACIÓN LIMPIA
    pacman -Qi manga-reader-local
 
    Debe mostrar:
-   Versión: 1.0.0-3
+   Versión: 1.0.0-5
 
 4. Abre Manga Reader desde el menú de aplicaciones.
 
