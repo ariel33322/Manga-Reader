@@ -3,11 +3,12 @@ import json
 import sqlite3
 import re
 import zipfile
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDir, QSettings, QStorageInfo, QSize, QTimer
-from PySide6.QtGui import QCursor, QPixmap, QImage, QIcon
+from PySide6.QtCore import Qt, QDir, QSettings, QStorageInfo, QSize, QTimer, QEvent
+from PySide6.QtGui import QCursor, QPixmap, QImage, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -93,6 +96,100 @@ def clear_layout(layout):
             clear_layout(child_layout)
 
 
+def scan_chapter_folders(parent_folder):
+    """
+    Devuelve [(nombre_capitulo, [imagenes...]), ...] de las
+    subcarpetas que contienen imágenes compatibles.
+    """
+    parent_path = Path(parent_folder)
+
+    if not parent_path.exists() or not parent_path.is_dir():
+        return []
+
+    chapter_folders = []
+
+    for folder in parent_path.iterdir():
+        if not folder.is_dir():
+            continue
+
+        images = [
+            str(path)
+            for path in folder.iterdir()
+            if (
+                path.is_file()
+                and path.suffix.lower()
+                in IMAGE_EXTENSIONS
+            )
+        ]
+
+        if not images:
+            continue
+
+        chapter_folders.append((
+            folder.name,
+            sorted(
+                images,
+                key=natural_sort_key,
+            ),
+        ))
+
+    chapter_folders.sort(
+        key=lambda item:
+            natural_sort_key(item[0])
+    )
+
+    return chapter_folders
+
+
+def import_new_chapter_folders(
+    database,
+    manga_id,
+    parent_folder,
+    mark_new=True,
+):
+    """
+    Importa solamente las carpetas cuyo nombre todavía no existe
+    como capítulo. Devuelve (importados, omitidos, encontrados).
+    """
+    chapter_folders = scan_chapter_folders(
+        parent_folder
+    )
+
+    existing_titles = {
+        chapter[2].strip().casefold()
+        for chapter in database.get_chapters(
+            manga_id
+        )
+    }
+
+    new_chapters = [
+        item
+        for item in chapter_folders
+        if item[0].strip().casefold()
+        not in existing_titles
+    ]
+
+    for title, images in new_chapters:
+        database.add_chapter(
+            manga_id,
+            title,
+            "images",
+            images,
+            is_new=mark_new,
+        )
+
+    skipped = (
+        len(chapter_folders)
+        - len(new_chapters)
+    )
+
+    return (
+        len(new_chapters),
+        skipped,
+        len(chapter_folders),
+    )
+
+
 # ============================================================
 # BASE DE DATOS
 # ============================================================
@@ -123,7 +220,8 @@ class Database:
                 genres TEXT,
                 status TEXT,
                 favorite INTEGER DEFAULT 0,
-                reading_state TEXT DEFAULT 'Leyendo'
+                reading_state TEXT DEFAULT 'Leyendo',
+                source_folder TEXT DEFAULT ''
             )
         """)
 
@@ -135,7 +233,8 @@ class Database:
                 content_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 position INTEGER DEFAULT 0,
-                is_read INTEGER DEFAULT 0
+                is_read INTEGER DEFAULT 0,
+                is_new INTEGER DEFAULT 0
             )
         """)
 
@@ -173,6 +272,12 @@ class Database:
                 ADD COLUMN reading_state TEXT DEFAULT 'Leyendo'
             """)
 
+        if "source_folder" not in manga_columns:
+            cursor.execute("""
+                ALTER TABLE manga
+                ADD COLUMN source_folder TEXT DEFAULT ''
+            """)
+
         cursor.execute(
             "PRAGMA table_info(chapters)"
         )
@@ -186,6 +291,12 @@ class Database:
             cursor.execute("""
                 ALTER TABLE chapters
                 ADD COLUMN is_read INTEGER DEFAULT 0
+            """)
+
+        if "is_new" not in chapter_columns:
+            cursor.execute("""
+                ALTER TABLE chapters
+                ADD COLUMN is_new INTEGER DEFAULT 0
             """)
 
         self.connection.commit()
@@ -379,6 +490,46 @@ class Database:
 
         return cursor.fetchone()
 
+    def set_manga_source_folder(
+        self,
+        manga_id,
+        folder,
+    ):
+        cursor = self.connection.cursor()
+
+        cursor.execute("""
+            UPDATE manga
+            SET source_folder = ?
+            WHERE id = ?
+        """, (
+            str(folder or ""),
+            manga_id,
+        ))
+
+        self.connection.commit()
+
+    def get_manga_source_folder(
+        self,
+        manga_id,
+    ):
+        cursor = self.connection.cursor()
+
+        cursor.execute("""
+            SELECT source_folder
+            FROM manga
+            WHERE id = ?
+        """, (
+            manga_id,
+        ))
+
+        row = cursor.fetchone()
+
+        return (
+            row[0]
+            if row and row[0]
+            else ""
+        )
+
     def delete_manga(
         self,
         manga_id,
@@ -412,6 +563,7 @@ class Database:
         title,
         content_type,
         content,
+        is_new=False,
     ):
         cursor = self.connection.cursor()
 
@@ -434,15 +586,17 @@ class Database:
                 content_type,
                 content,
                 position,
-                is_read
+                is_read,
+                is_new
             )
-            VALUES (?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
         """, (
             manga_id,
             title,
             content_type,
             json.dumps(content),
             position,
+            int(is_new),
         ))
 
         self.connection.commit()
@@ -454,9 +608,7 @@ class Database:
     ):
         cursor = self.connection.cursor()
 
-        direction = "DESC" if reverse else "ASC"
-
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT
                 id,
                 manga_id,
@@ -464,15 +616,25 @@ class Database:
                 content_type,
                 content,
                 position,
-                is_read
+                is_read,
+                is_new
             FROM chapters
             WHERE manga_id = ?
-            ORDER BY position {direction}, id {direction}
         """, (
             manga_id,
         ))
 
-        return cursor.fetchall()
+        chapters = cursor.fetchall()
+
+        chapters.sort(
+            key=lambda chapter:
+                natural_sort_key(
+                    chapter[2]
+                ),
+            reverse=reverse,
+        )
+
+        return chapters
 
     def get_chapter(
         self,
@@ -488,7 +650,8 @@ class Database:
                 content_type,
                 content,
                 position,
-                is_read
+                is_read,
+                is_new
             FROM chapters
             WHERE id = ?
         """, (
@@ -504,14 +667,24 @@ class Database:
     ):
         cursor = self.connection.cursor()
 
-        cursor.execute("""
-            UPDATE chapters
-            SET is_read = ?
-            WHERE id = ?
-        """, (
-            int(is_read),
-            chapter_id,
-        ))
+        if is_read:
+            cursor.execute("""
+                UPDATE chapters
+                SET
+                    is_read = 1,
+                    is_new = 0
+                WHERE id = ?
+            """, (
+                chapter_id,
+            ))
+        else:
+            cursor.execute("""
+                UPDATE chapters
+                SET is_read = 0
+                WHERE id = ?
+            """, (
+                chapter_id,
+            ))
 
         self.connection.commit()
 
@@ -557,6 +730,269 @@ class Database:
                     "DELETE FROM progress WHERE manga_id = ?",
                     (manga_id,)
                 )
+
+        self.connection.commit()
+
+    def set_chapter_new(
+        self,
+        chapter_id,
+        is_new=False,
+    ):
+        cursor = self.connection.cursor()
+
+        cursor.execute("""
+            UPDATE chapters
+            SET is_new = ?
+            WHERE id = ?
+        """, (
+            int(is_new),
+            chapter_id,
+        ))
+
+        self.connection.commit()
+
+    def get_new_chapter_count(
+        self,
+        manga_id,
+    ):
+        cursor = self.connection.cursor()
+
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM chapters
+            WHERE
+                manga_id = ?
+                AND is_new = 1
+                AND is_read = 0
+        """, (
+            manga_id,
+        ))
+
+        return int(
+            cursor.fetchone()[0]
+        )
+
+    def set_chapters_read_bulk(
+        self,
+        chapter_ids,
+        is_read,
+    ):
+        ids = [
+            int(chapter_id)
+            for chapter_id in chapter_ids
+        ]
+
+        if not ids:
+            return
+
+        placeholders = ",".join(
+            "?"
+            for _ in ids
+        )
+
+        cursor = self.connection.cursor()
+
+        if is_read:
+            cursor.execute(
+                f"""
+                UPDATE chapters
+                SET
+                    is_read = 1,
+                    is_new = 0
+                WHERE id IN ({placeholders})
+                """,
+                tuple(ids),
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE chapters
+                SET is_read = 0
+                WHERE id IN ({placeholders})
+                """,
+                tuple(ids),
+            )
+
+        self.connection.commit()
+
+    def delete_chapters_bulk(
+        self,
+        chapter_ids,
+    ):
+        for chapter_id in list(chapter_ids):
+            self.delete_chapter(
+                int(chapter_id)
+            )
+
+    def export_backup(
+        self,
+        destination,
+    ):
+        cursor = self.connection.cursor()
+
+        cursor.execute("""
+            SELECT
+                id,
+                title,
+                cover,
+                synopsis,
+                genres,
+                status,
+                favorite,
+                reading_state,
+                source_folder
+            FROM manga
+            ORDER BY id
+        """)
+
+        manga_rows = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT
+                id,
+                manga_id,
+                title,
+                content_type,
+                content,
+                position,
+                is_read,
+                is_new
+            FROM chapters
+            ORDER BY id
+        """)
+
+        chapter_rows = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT
+                manga_id,
+                chapter_id,
+                page_index
+            FROM progress
+            ORDER BY manga_id
+        """)
+
+        progress_rows = cursor.fetchall()
+
+        data = {
+            "format": "manga-reader-backup",
+            "version": 1,
+            "created_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            "manga": [
+                list(row)
+                for row in manga_rows
+            ],
+            "chapters": [
+                list(row)
+                for row in chapter_rows
+            ],
+            "progress": [
+                list(row)
+                for row in progress_rows
+            ],
+        }
+
+        Path(destination).write_text(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def import_backup(
+        self,
+        source,
+    ):
+        data = json.loads(
+            Path(source).read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if (
+            data.get("format")
+            != "manga-reader-backup"
+        ):
+            raise ValueError(
+                "El archivo no es un respaldo de Manga Reader."
+            )
+
+        cursor = self.connection.cursor()
+
+        cursor.execute(
+            "DELETE FROM progress"
+        )
+        cursor.execute(
+            "DELETE FROM chapters"
+        )
+        cursor.execute(
+            "DELETE FROM manga"
+        )
+
+        for row in data.get(
+            "manga",
+            [],
+        ):
+            values = list(row) + [""] * (
+                9 - len(row)
+            )
+
+            cursor.execute("""
+                INSERT INTO manga (
+                    id,
+                    title,
+                    cover,
+                    synopsis,
+                    genres,
+                    status,
+                    favorite,
+                    reading_state,
+                    source_folder
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(values[:9]))
+
+        for row in data.get(
+            "chapters",
+            [],
+        ):
+            values = list(row) + [0] * (
+                8 - len(row)
+            )
+
+            cursor.execute("""
+                INSERT INTO chapters (
+                    id,
+                    manga_id,
+                    title,
+                    content_type,
+                    content,
+                    position,
+                    is_read,
+                    is_new
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, tuple(values[:8]))
+
+        for row in data.get(
+            "progress",
+            [],
+        ):
+            if len(row) < 3:
+                continue
+
+            cursor.execute("""
+                INSERT INTO progress (
+                    manga_id,
+                    chapter_id,
+                    page_index
+                )
+                VALUES (?, ?, ?)
+            """, tuple(row[:3]))
 
         self.connection.commit()
 
@@ -696,6 +1132,30 @@ class FilePickerDialog(QDialog):
 
             self.allowed_extensions = IMAGE_EXTENSIONS
 
+        elif mode == "folder":
+            self.setWindowTitle(
+                "Seleccionar carpeta"
+            )
+
+            title_text = (
+                "Seleccionar carpeta"
+            )
+
+            self.allowed_extensions = set()
+
+        elif mode == "backup":
+            self.setWindowTitle(
+                "Seleccionar respaldo"
+            )
+
+            title_text = (
+                "Seleccionar respaldo de Manga Reader"
+            )
+
+            self.allowed_extensions = {
+                ".json"
+            }
+
         else:
             self.setWindowTitle(
                 "Seleccionar capítulo"
@@ -767,27 +1227,34 @@ class FilePickerDialog(QDialog):
 
         self.model = QFileSystemModel()
 
-        self.model.setFilter(
-            QDir.AllDirs
-            | QDir.Files
-            | QDir.NoDotAndDotDot
-        )
+        if mode == "folder":
+            self.model.setFilter(
+                QDir.AllDirs
+                | QDir.NoDotAndDotDot
+            )
+        else:
+            self.model.setFilter(
+                QDir.AllDirs
+                | QDir.Files
+                | QDir.NoDotAndDotDot
+            )
 
         self.model.setRootPath(
             "/"
         )
 
-        self.model.setNameFilters([
-            f"*{extension}"
-            for extension
-            in sorted(
-                self.allowed_extensions
-            )
-        ])
+        if mode != "folder":
+            self.model.setNameFilters([
+                f"*{extension}"
+                for extension
+                in sorted(
+                    self.allowed_extensions
+                )
+            ])
 
-        self.model.setNameFilterDisables(
-            False
-        )
+            self.model.setNameFilterDisables(
+                False
+            )
 
         self.tree = QTreeView()
 
@@ -822,7 +1289,9 @@ class FilePickerDialog(QDialog):
         )
 
         self.selection_text = QLabel(
-            "Selecciona el contenido."
+            "Selecciona una carpeta."
+            if mode == "folder"
+            else "Selecciona el contenido."
         )
 
         explorer.addWidget(
@@ -848,7 +1317,9 @@ class FilePickerDialog(QDialog):
         )
 
         select_button = QPushButton(
-            "Seleccionar"
+            "Seleccionar carpeta"
+            if mode == "folder"
+            else "Seleccionar"
         )
 
         select_button.setObjectName(
@@ -1111,6 +1582,41 @@ class FilePickerDialog(QDialog):
             .selectedRows(0)
         )
 
+        if self.mode == "folder":
+            selected_path = None
+
+            if indexes:
+                candidate = Path(
+                    self.model.filePath(
+                        indexes[0]
+                    )
+                )
+
+                if candidate.is_dir():
+                    selected_path = candidate
+
+            if selected_path is None:
+                candidate = Path(
+                    self.path_label.text()
+                )
+
+                if candidate.is_dir():
+                    selected_path = candidate
+
+            if selected_path is None:
+                QMessageBox.warning(
+                    self,
+                    "Manga Reader",
+                    "Selecciona una carpeta.",
+                )
+                return
+
+            self.selected_files = [
+                str(selected_path)
+            ]
+            self.accept()
+            return
+
         files = []
 
         for index in indexes:
@@ -1159,6 +1665,18 @@ class FilePickerDialog(QDialog):
             return []
 
         return self.selected_files
+
+    def get_folder(self):
+        if (
+            self.exec()
+            != QDialog.Accepted
+        ):
+            return None
+
+        if not self.selected_files:
+            return None
+
+        return self.selected_files[0]
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -1785,6 +2303,10 @@ class AddChapterDialog(QDialog):
             "primaryButton"
         )
 
+        folder_button = QPushButton(
+            "Seleccionar carpeta de imágenes"
+        )
+
         file_button = QPushButton(
             "Seleccionar PDF / CBZ / ZIP"
         )
@@ -1793,12 +2315,20 @@ class AddChapterDialog(QDialog):
             self.choose_images
         )
 
+        folder_button.clicked.connect(
+            self.choose_image_folder
+        )
+
         file_button.clicked.connect(
             self.choose_file
         )
 
         root.addWidget(
             image_button
+        )
+
+        root.addWidget(
+            folder_button
         )
 
         root.addWidget(
@@ -1817,9 +2347,11 @@ class AddChapterDialog(QDialog):
             "Formatos compatibles\n\n"
             "Imágenes: JPG, JPEG, PNG, WEBP, BMP\n"
             "Archivos: PDF, CBZ, ZIP\n\n"
-            "Si usas imágenes, selecciona todas las páginas "
-            "del capítulo al mismo tiempo. Manga Reader las "
-            "ordenará automáticamente por el nombre del archivo."
+            "Puedes seleccionar páginas sueltas o una carpeta "
+            "completa del capítulo. Manga Reader ordenará las "
+            "imágenes automáticamente por el nombre del archivo.\n\n"
+            "Para muchos capítulos a la vez usa "
+            "Configuración → Importar capítulos."
         )
 
         note.setWordWrap(
@@ -1894,6 +2426,52 @@ class AddChapterDialog(QDialog):
 
         self.selection_label.setText(
             "Contenido seleccionado."
+        )
+
+    def choose_image_folder(self):
+        picker = FilePickerDialog(
+            self,
+            "folder",
+        )
+
+        folder = picker.get_folder()
+
+        if not folder:
+            return
+
+        folder_path = Path(folder)
+
+        files = [
+            str(path)
+            for path in folder_path.iterdir()
+            if (
+                path.is_file()
+                and path.suffix.lower()
+                in IMAGE_EXTENSIONS
+            )
+        ]
+
+        if not files:
+            QMessageBox.warning(
+                self,
+                "Manga Reader",
+                "La carpeta no contiene imágenes compatibles.",
+            )
+            return
+
+        self.selected_files = sorted(
+            files,
+            key=natural_sort_key,
+        )
+
+        self.content_type = "images"
+
+        self.name_input.setText(
+            folder_path.name
+        )
+
+        self.selection_label.setText(
+            f"Carpeta seleccionada: {folder_path.name}"
         )
 
     def choose_file(self):
@@ -2009,7 +2587,61 @@ class AddChapterDialog(QDialog):
 # LECTOR DE CAPÍTULOS
 # ============================================================
 
+class ReaderPageLabel(QLabel):
+    def __init__(
+        self,
+        callback,
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.callback = callback
+
+        self.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.setCursor(
+            QCursor(
+                Qt.PointingHandCursor
+            )
+        )
+
+    def mousePressEvent(
+        self,
+        event,
+    ):
+        if (
+            event.button()
+            == Qt.LeftButton
+            and self.callback
+        ):
+            side = (
+                "left"
+                if event.position().x()
+                < self.width() / 2
+                else "right"
+            )
+
+            self.callback(
+                side
+            )
+
+        super().mousePressEvent(
+            event
+        )
+
+
 class ChapterReader(QDialog):
+    """
+    Lector con tres modos:
+    - Vertical continuo
+    - Página
+    - Doble página
+
+    No muestra porcentajes ni barras de progreso.
+    """
+
     def __init__(
         self,
         database,
@@ -2025,6 +2657,29 @@ class ChapterReader(QDialog):
         self.title = ""
         self.content_type = ""
         self.content = []
+        self.page_pixmaps = []
+        self.current_page = 0
+        self.zoom_factor = 1.0
+
+        self.settings = QSettings(
+            APP_ORG,
+            APP_NAME,
+        )
+
+        self.reader_mode = self.settings.value(
+            "reader/mode",
+            "Vertical",
+        )
+
+        self.reading_direction = self.settings.value(
+            "reader/direction",
+            "Derecha → izquierda",
+        )
+
+        self.fit_mode = self.settings.value(
+            "reader/fit",
+            "Ajustar ancho",
+        )
 
         self.setWindowTitle(
             "Lector"
@@ -2036,127 +2691,270 @@ class ChapterReader(QDialog):
         )
 
         root = QVBoxLayout(self)
-
         root.setContentsMargins(
             0,
             0,
             0,
             0,
         )
-
         root.setSpacing(
             0
         )
 
         # ----------------------------------------------------
-        # Navegación del capítulo
+        # Barra superior: capítulo anterior / siguiente
         # ----------------------------------------------------
-
         nav_frame = QFrame()
         nav_frame.setObjectName(
             "readerNavBar"
         )
 
-        nav_layout = QHBoxLayout(
+        nav = QHBoxLayout(
             nav_frame
         )
-
-        nav_layout.setContentsMargins(
+        nav.setContentsMargins(
             14,
-            8,
+            7,
             14,
-            8,
+            7,
         )
-
-        nav_layout.setSpacing(
-            10
+        nav.setSpacing(
+            8
         )
-
-        nav_layout.addStretch()
 
         self.previous_button = QPushButton(
             "‹  Anterior"
         )
-
         self.previous_button.setObjectName(
             "chapterArrow"
         )
-
-        self.previous_button.setFixedSize(
-            130,
-            42,
-        )
-
         self.previous_button.clicked.connect(
             self.go_previous
         )
 
         self.title_label = QLabel()
-
         self.title_label.setObjectName(
             "readerTitle"
         )
-
         self.title_label.setAlignment(
             Qt.AlignCenter
         )
-
         self.title_label.setMinimumWidth(
-            240
+            180
         )
 
         self.next_button = QPushButton(
             "Siguiente  ›"
         )
-
         self.next_button.setObjectName(
             "chapterArrow"
         )
-
-        self.next_button.setFixedSize(
-            130,
-            42,
-        )
-
         self.next_button.clicked.connect(
             self.go_next
         )
 
-        nav_layout.addWidget(
+        nav.addStretch()
+        nav.addWidget(
             self.previous_button
         )
-
-        nav_layout.addWidget(
+        nav.addWidget(
             self.title_label
         )
-
-        nav_layout.addWidget(
+        nav.addWidget(
             self.next_button
         )
-
-        nav_layout.addStretch()
+        nav.addStretch()
 
         root.addWidget(
             nav_frame
         )
 
         # ----------------------------------------------------
-        # Área del lector
+        # Herramientas del lector
         # ----------------------------------------------------
+        tools_frame = QFrame()
+        tools_frame.setObjectName(
+            "readerTools"
+        )
 
+        tools = QHBoxLayout(
+            tools_frame
+        )
+        tools.setContentsMargins(
+            14,
+            6,
+            14,
+            6,
+        )
+        tools.setSpacing(
+            8
+        )
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Vertical",
+            "Página",
+            "Doble página",
+        ])
+        self.mode_combo.setCurrentText(
+            self.reader_mode
+        )
+        self.mode_combo.currentTextChanged.connect(
+            self.change_reader_mode
+        )
+
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItems([
+            "Derecha → izquierda",
+            "Izquierda → derecha",
+        ])
+        self.direction_combo.setCurrentText(
+            self.reading_direction
+        )
+        self.direction_combo.currentTextChanged.connect(
+            self.change_direction
+        )
+
+        self.fit_combo = QComboBox()
+        self.fit_combo.addItems([
+            "Ajustar ancho",
+            "Ajustar alto",
+            "Tamaño original",
+        ])
+        self.fit_combo.setCurrentText(
+            self.fit_mode
+        )
+        self.fit_combo.currentTextChanged.connect(
+            self.change_fit_mode
+        )
+
+        zoom_out = QPushButton(
+            "−"
+        )
+        zoom_out.setObjectName(
+            "readerSmallButton"
+        )
+        zoom_out.clicked.connect(
+            lambda:
+                self.change_zoom(-0.1)
+        )
+
+        self.zoom_label = QLabel(
+            "100%"
+        )
+        self.zoom_label.setObjectName(
+            "readerZoom"
+        )
+        self.zoom_label.setAlignment(
+            Qt.AlignCenter
+        )
+        self.zoom_label.setMinimumWidth(
+            56
+        )
+
+        zoom_reset = QPushButton(
+            "100%"
+        )
+        zoom_reset.setObjectName(
+            "readerSmallButton"
+        )
+        zoom_reset.clicked.connect(
+            self.reset_zoom
+        )
+
+        zoom_in = QPushButton(
+            "+"
+        )
+        zoom_in.setObjectName(
+            "readerSmallButton"
+        )
+        zoom_in.clicked.connect(
+            lambda:
+                self.change_zoom(0.1)
+        )
+
+        fullscreen = QPushButton(
+            "⛶"
+        )
+        fullscreen.setObjectName(
+            "readerSmallButton"
+        )
+        fullscreen.setToolTip(
+            "Pantalla completa (F11)"
+        )
+        fullscreen.clicked.connect(
+            self.toggle_fullscreen
+        )
+
+        tools.addWidget(
+            self.mode_combo
+        )
+        tools.addWidget(
+            self.direction_combo
+        )
+        tools.addWidget(
+            self.fit_combo
+        )
+        tools.addStretch()
+        tools.addWidget(
+            zoom_out
+        )
+        tools.addWidget(
+            self.zoom_label
+        )
+        tools.addWidget(
+            zoom_reset
+        )
+        tools.addWidget(
+            zoom_in
+        )
+        tools.addWidget(
+            fullscreen
+        )
+
+        root.addWidget(
+            tools_frame
+        )
+
+        # ----------------------------------------------------
+        # Área de páginas
+        # ----------------------------------------------------
         self.scroll = QScrollArea()
-
         self.scroll.setWidgetResizable(
             True
+        )
+        self.scroll.setFrameShape(
+            QFrame.NoFrame
+        )
+        self.scroll.viewport().installEventFilter(
+            self
+        )
+
+        self.reader_widget = QWidget()
+        self.reader_layout = QVBoxLayout(
+            self.reader_widget
+        )
+        self.reader_layout.setContentsMargins(
+            18,
+            18,
+            18,
+            26,
+        )
+        self.reader_layout.setSpacing(
+            6
+        )
+        self.reader_layout.setAlignment(
+            Qt.AlignTop
+            | Qt.AlignHCenter
+        )
+
+        self.scroll.setWidget(
+            self.reader_widget
         )
 
         root.addWidget(
             self.scroll,
             1,
-        )
-
-        self.scroll.verticalScrollBar().valueChanged.connect(
-            self.on_scroll
         )
 
         self.load_chapter(
@@ -2166,7 +2964,7 @@ class ChapterReader(QDialog):
         self.apply_styles()
 
     # ========================================================
-    # CAMBIO DE CAPÍTULO
+    # Capítulos
     # ========================================================
 
     def get_adjacent_chapter_id(
@@ -2176,12 +2974,9 @@ class ChapterReader(QDialog):
         if not self.manga_id:
             return None
 
-        chapters = (
-            self.database
-            .get_chapters(
-                self.manga_id,
-                reverse=False,
-            )
+        chapters = self.database.get_chapters(
+            self.manga_id,
+            reverse=False,
         )
 
         ids = [
@@ -2196,121 +2991,69 @@ class ChapterReader(QDialog):
             self.chapter_id
         )
 
-        target_index = (
+        target = (
             index + direction
         )
 
         if (
-            target_index < 0
-            or target_index >= len(ids)
+            target < 0
+            or target >= len(ids)
         ):
             return None
 
-        return ids[
-            target_index
-        ]
+        return ids[target]
 
     def update_navigation_buttons(self):
-        previous_id = (
+        self.previous_button.setEnabled(
             self.get_adjacent_chapter_id(
                 -1
             )
-        )
-
-        next_id = (
-            self.get_adjacent_chapter_id(
-                1
-            )
-        )
-
-        self.previous_button.setEnabled(
-            previous_id is not None
+            is not None
         )
 
         self.next_button.setEnabled(
-            next_id is not None
-        )
-
-    def go_previous(self):
-        chapter_id = (
-            self.get_adjacent_chapter_id(
-                -1
-            )
-        )
-
-        if chapter_id is None:
-            return
-
-        self.load_chapter(
-            chapter_id
-        )
-
-    def go_next(self):
-        chapter_id = (
             self.get_adjacent_chapter_id(
                 1
             )
+            is not None
         )
 
-        if chapter_id is None:
-            return
-
-        self.load_chapter(
-            chapter_id
+    def go_previous(self):
+        chapter_id = self.get_adjacent_chapter_id(
+            -1
         )
 
-    # ========================================================
-    # CARGAR CAPÍTULO
-    # ========================================================
+        if chapter_id is not None:
+            self.load_chapter(
+                chapter_id
+            )
+
+    def go_next(self):
+        chapter_id = self.get_adjacent_chapter_id(
+            1
+        )
+
+        if chapter_id is not None:
+            self.load_chapter(
+                chapter_id
+            )
 
     def load_chapter(
         self,
         chapter_id,
     ):
-        chapter = (
-            self.database
-            .get_chapter(
-                chapter_id
-            )
+        chapter = self.database.get_chapter(
+            chapter_id
         )
 
         if not chapter:
             return
 
-        # Guardamos progreso del capítulo anterior antes
-        # de cambiar de capítulo.
-        if self.manga_id is not None:
-            current_scroll = (
-                self.scroll
-                .verticalScrollBar()
-                .value()
-            )
-
-            self.database.set_progress(
-                self.manga_id,
-                self.chapter_id,
-                current_scroll,
-            )
-
-        self.chapter_id = (
-            chapter_id
-        )
-
-        self.chapter = (
-            chapter
-        )
-
-        self.manga_id = (
-            chapter[1]
-        )
-
-        self.title = (
-            chapter[2]
-        )
-
-        self.content_type = (
-            chapter[3]
-        )
+        self.chapter_id = chapter_id
+        self.chapter = chapter
+        self.manga_id = chapter[1]
+        self.title = chapter[2]
+        self.content_type = chapter[3]
 
         try:
             self.content = json.loads(
@@ -2319,175 +3062,64 @@ class ChapterReader(QDialog):
         except Exception:
             self.content = []
 
-        # Abrir un capítulo lo marca inmediatamente como leído.
-        # Se guarda directamente en SQLite antes de dibujar el contenido.
+        # Abrirlo = leído. También deja de ser "Nuevo".
         self.database.set_chapter_read(
-            self.chapter_id,
+            chapter_id,
             True,
+        )
+        self.database.set_chapter_new(
+            chapter_id,
+            False,
+        )
+
+        # Mantener "Continuar" sin mostrar porcentajes/progreso.
+        self.database.set_progress(
+            self.manga_id,
+            chapter_id,
+            0,
         )
 
         self.setWindowTitle(
-            self.title
+            f"{self.title} — Manga Reader"
         )
-
         self.title_label.setText(
             self.title
         )
 
-        self.build_reader_widget()
-
-        self.database.set_progress(
-            self.manga_id,
-            self.chapter_id,
-            0,
+        self.current_page = 0
+        self.page_pixmaps = (
+            self.load_all_pages()
         )
 
-        self.restore_progress()
-
+        self.render_current_mode()
         self.update_navigation_buttons()
 
-    def build_reader_widget(self):
-        # No reemplazamos el widget completo del QScrollArea al cambiar
-        # de capítulo. Reutilizamos el mismo contenedor y solo limpiamos
-        # sus páginas. Esto evita que la vista quede negra al navegar
-        # con Anterior / Siguiente.
-
-        if not hasattr(
-            self,
-            "reader_widget",
-        ):
-            self.reader_widget = QWidget()
-
-            self.reader_layout = QVBoxLayout(
-                self.reader_widget
-            )
-
-            self.reader_layout.setContentsMargins(
-                20,
-                20,
-                20,
-                30,
-            )
-
-            self.reader_layout.setSpacing(
-                6
-            )
-
-            self.reader_layout.setAlignment(
-                Qt.AlignTop
-                | Qt.AlignHCenter
-            )
-
-            self.scroll.setWidget(
-                self.reader_widget
-            )
-
-        else:
-            # Limpiar únicamente las páginas del capítulo anterior.
-            while self.reader_layout.count():
-                item = self.reader_layout.takeAt(
-                    0
-                )
-
-                widget = item.widget()
-
-                if widget is not None:
-                    widget.deleteLater()
-
-                child_layout = item.layout()
-
-                if child_layout is not None:
-                    while child_layout.count():
-                        child_item = child_layout.takeAt(
-                            0
-                        )
-
-                        child_widget = child_item.widget()
-
-                        if child_widget is not None:
-                            child_widget.deleteLater()
-
-        # Volver al inicio inmediatamente al cambiar de capítulo.
-        self.scroll.verticalScrollBar().setValue(
-            0
-        )
-
-        self.load_content()
-
-        # Forzar actualización visual después de crear todas las páginas.
-        self.reader_widget.adjustSize()
-        self.reader_widget.updateGeometry()
-        self.scroll.viewport().update()
-        QApplication.processEvents()
-
     # ========================================================
-    # CONTENIDO
+    # Carga de páginas
     # ========================================================
 
-    def add_pixmap(
-        self,
-        pixmap,
-    ):
-        if pixmap.isNull():
-            return
-
-        label = QLabel()
-
-        label.setAlignment(
-            Qt.AlignCenter
-        )
-
-        label.setPixmap(
-            pixmap
-        )
-
-        self.reader_layout.addWidget(
-            label,
-            0,
-            Qt.AlignHCenter,
-        )
-
-    def scale_pixmap_to_reader(
-        self,
-        pixmap,
-    ):
-        max_width = 950
-
-        if pixmap.width() <= max_width:
-            return pixmap
-
-        return pixmap.scaledToWidth(
-            max_width,
-            Qt.SmoothTransformation,
-        )
-
-    def load_content(self):
+    def load_all_pages(self):
         if self.content_type == "images":
-            self.load_images()
+            return self.pages_from_images()
 
-        elif self.content_type in {
+        if self.content_type in {
             "cbz",
             "zip",
         }:
-            self.load_archive()
+            return self.pages_from_archive()
 
-        elif self.content_type == "pdf":
-            self.load_pdf()
+        if self.content_type == "pdf":
+            return self.pages_from_pdf()
 
-        else:
-            self.show_error(
-                "Formato de capítulo no compatible."
-            )
+        return []
 
-        self.reader_layout.addStretch()
+    def pages_from_images(self):
+        pages = []
 
-    def load_images(self):
-        files = sorted(
+        for file_path in sorted(
             self.content,
             key=natural_sort_key,
-        )
-
-        for file_path in files:
+        ):
             path = Path(
                 file_path
             )
@@ -2499,35 +3131,25 @@ class ChapterReader(QDialog):
                 str(path)
             )
 
-            if pixmap.isNull():
-                continue
-
-            pixmap = (
-                self.scale_pixmap_to_reader(
+            if not pixmap.isNull():
+                pages.append(
                     pixmap
                 )
-            )
 
-            self.add_pixmap(
-                pixmap
-            )
+        return pages
 
-    def load_archive(self):
+    def pages_from_archive(self):
+        pages = []
+
         if not self.content:
-            self.show_error(
-                "El capítulo no contiene ningún archivo."
-            )
-            return
+            return pages
 
         archive_path = Path(
             self.content[0]
         )
 
         if not archive_path.exists():
-            self.show_error(
-                "No se encontró el archivo del capítulo."
-            )
-            return
+            return pages
 
         try:
             with zipfile.ZipFile(
@@ -2536,8 +3158,7 @@ class ChapterReader(QDialog):
             ) as archive:
                 names = [
                     name
-                    for name
-                    in archive.namelist()
+                    for name in archive.namelist()
                     if (
                         not name.endswith("/")
                         and Path(name)
@@ -2552,54 +3173,39 @@ class ChapterReader(QDialog):
                 )
 
                 for name in names:
-                    data = archive.read(
-                        name
-                    )
-
                     pixmap = QPixmap()
 
-                    if not pixmap.loadFromData(
-                        data
+                    if pixmap.loadFromData(
+                        archive.read(name)
                     ):
-                        continue
-
-                    pixmap = (
-                        self.scale_pixmap_to_reader(
+                        pages.append(
                             pixmap
                         )
-                    )
-
-                    self.add_pixmap(
-                        pixmap
-                    )
 
         except Exception as error:
-            self.show_error(
-                f"No se pudo abrir el archivo:\n{error}"
+            QMessageBox.warning(
+                self,
+                "Manga Reader",
+                f"No se pudo abrir el archivo:\n{error}",
             )
 
-    def load_pdf(self):
-        if not self.content:
-            self.show_error(
-                "El capítulo no contiene ningún PDF."
-            )
-            return
+        return pages
+
+    def pages_from_pdf(self):
+        pages = []
+
+        if (
+            not self.content
+            or not HAS_QTPDF
+        ):
+            return pages
 
         pdf_path = Path(
             self.content[0]
         )
 
         if not pdf_path.exists():
-            self.show_error(
-                "No se encontró el PDF."
-            )
-            return
-
-        if not HAS_QTPDF:
-            self.show_error(
-                "Tu instalación de PySide6 no incluye QtPdf."
-            )
-            return
+            return pages
 
         document = QPdfDocument(
             self
@@ -2609,130 +3215,607 @@ class ChapterReader(QDialog):
             str(pdf_path)
         )
 
-        if document.pageCount() <= 0:
-            self.show_error(
-                "No se pudo leer el PDF."
-            )
-            return
-
         for page in range(
             document.pageCount()
         ):
-            try:
-                point_size = (
-                    document
-                    .pagePointSize(
-                        page
-                    )
+            point_size = document.pagePointSize(
+                page
+            )
+
+            width = 1600
+
+            ratio = (
+                point_size.height()
+                / point_size.width()
+                if point_size.width() > 0
+                else 1.414
+            )
+
+            image = document.render(
+                page,
+                QSize(
+                    width,
+                    max(
+                        1,
+                        int(width * ratio),
+                    ),
+                ),
+            )
+
+            pixmap = QPixmap.fromImage(
+                image
+            )
+
+            if not pixmap.isNull():
+                pages.append(
+                    pixmap
                 )
 
-                width = 950
+        return pages
 
-                if point_size.width() > 0:
-                    ratio = (
-                        point_size.height()
-                        / point_size.width()
-                    )
-                else:
-                    ratio = 1.414
+    # ========================================================
+    # Render
+    # ========================================================
 
-                height = max(
-                    1,
-                    int(
-                        width * ratio
-                    )
-                )
-
-                image = document.render(
-                    page,
-                    QSize(
-                        width,
-                        height,
-                    )
-                )
-
-                pixmap = QPixmap.fromImage(
-                    image
-                )
-
-                if not pixmap.isNull():
-                    self.add_pixmap(
-                        pixmap
-                    )
-
-            except Exception as error:
-                self.show_error(
-                    f"Error al mostrar una página del PDF:\n{error}"
-                )
-                break
-
-    def show_error(
+    def scaled_pixmap(
         self,
-        text,
+        pixmap,
+        pages_on_screen=1,
     ):
-        label = QLabel(
-            text
+        if pixmap.isNull():
+            return pixmap
+
+        viewport = self.scroll.viewport().size()
+
+        available_width = max(
+            120,
+            viewport.width()
+            - 50
         )
 
-        label.setWordWrap(
-            True
+        available_height = max(
+            120,
+            viewport.height()
+            - 50
         )
 
-        label.setAlignment(
-            Qt.AlignCenter
+        if pages_on_screen == 2:
+            available_width = max(
+                120,
+                (available_width - 18) // 2
+            )
+
+        if self.fit_mode == "Ajustar ancho":
+            target_width = max(
+                1,
+                int(
+                    available_width
+                    * self.zoom_factor
+                ),
+            )
+
+            return pixmap.scaledToWidth(
+                target_width,
+                Qt.SmoothTransformation,
+            )
+
+        if self.fit_mode == "Ajustar alto":
+            target_height = max(
+                1,
+                int(
+                    available_height
+                    * self.zoom_factor
+                ),
+            )
+
+            return pixmap.scaledToHeight(
+                target_height,
+                Qt.SmoothTransformation,
+            )
+
+        target_width = max(
+            1,
+            int(
+                pixmap.width()
+                * self.zoom_factor
+            ),
         )
 
-        label.setObjectName(
-            "readerError"
+        return pixmap.scaledToWidth(
+            target_width,
+            Qt.SmoothTransformation,
         )
 
-        self.reader_layout.addWidget(
-            label
+    def clear_reader(self):
+        clear_layout(
+            self.reader_layout
         )
 
-    # ========================================================
-    # PROGRESO
-    # ========================================================
+    def render_current_mode(self):
+        self.clear_reader()
 
-    def restore_progress(self):
-        progress = (
-            self.database
-            .get_progress(
-                self.manga_id
+        if not self.page_pixmaps:
+            label = QLabel(
+                "No se encontraron páginas compatibles."
+            )
+            label.setObjectName(
+                "readerError"
+            )
+            label.setAlignment(
+                Qt.AlignCenter
+            )
+            self.reader_layout.addWidget(
+                label
+            )
+            return
+
+        if self.reader_mode == "Vertical":
+            self.render_vertical()
+        elif self.reader_mode == "Página":
+            self.render_single_page()
+        else:
+            self.render_double_page()
+
+        self.reader_widget.adjustSize()
+        self.reader_widget.updateGeometry()
+        self.scroll.viewport().update()
+
+    def render_vertical(self):
+        for pixmap in self.page_pixmaps:
+            label = ReaderPageLabel(
+                self.handle_page_click
+            )
+
+            label.setPixmap(
+                self.scaled_pixmap(
+                    pixmap,
+                    1,
+                )
+            )
+
+            self.reader_layout.addWidget(
+                label,
+                0,
+                Qt.AlignHCenter,
+            )
+
+        self.reader_layout.addStretch()
+
+    def render_single_page(self):
+        self.current_page = max(
+            0,
+            min(
+                self.current_page,
+                len(self.page_pixmaps) - 1,
+            ),
+        )
+
+        label = ReaderPageLabel(
+            self.handle_page_click
+        )
+
+        label.setPixmap(
+            self.scaled_pixmap(
+                self.page_pixmaps[
+                    self.current_page
+                ],
+                1,
             )
         )
 
-        if not progress:
-            return
-
-        saved_chapter_id = progress[0]
-        saved_scroll = progress[1] or 0
-
-        if saved_chapter_id != self.chapter_id:
-            return
-
-        QApplication.processEvents()
-
-        self.scroll.verticalScrollBar().setValue(
-            saved_scroll
+        self.reader_layout.addWidget(
+            label,
+            1,
+            Qt.AlignCenter,
         )
 
-    def on_scroll(
-        self,
-        value,
-    ):
-        if not self.manga_id:
-            return
-
-        self.database.set_progress(
-            self.manga_id,
-            self.chapter_id,
-            value,
+    def render_double_page(self):
+        self.current_page = max(
+            0,
+            min(
+                self.current_page,
+                len(self.page_pixmaps) - 1,
+            ),
         )
 
+        row_widget = QWidget()
+        row = QHBoxLayout(
+            row_widget
+        )
+        row.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+        row.setSpacing(
+            10
+        )
+        row.setAlignment(
+            Qt.AlignCenter
+        )
+
+        indexes = [
+            self.current_page
+        ]
+
+        if (
+            self.current_page + 1
+            < len(self.page_pixmaps)
+        ):
+            indexes.append(
+                self.current_page + 1
+            )
+
+        if (
+            self.reading_direction
+            == "Derecha → izquierda"
+        ):
+            indexes = list(
+                reversed(indexes)
+            )
+
+        for index in indexes:
+            label = ReaderPageLabel(
+                self.handle_page_click
+            )
+
+            label.setPixmap(
+                self.scaled_pixmap(
+                    self.page_pixmaps[
+                        index
+                    ],
+                    2,
+                )
+            )
+
+            row.addWidget(
+                label
+            )
+
+        self.reader_layout.addWidget(
+            row_widget,
+            1,
+            Qt.AlignCenter,
+        )
 
     # ========================================================
-    # ESTILO
+    # Navegación de páginas
+    # ========================================================
+
+    def page_step(self):
+        return (
+            2
+            if self.reader_mode
+            == "Doble página"
+            else 1
+        )
+
+    def next_page(self):
+        if self.reader_mode == "Vertical":
+            bar = self.scroll.verticalScrollBar()
+            new_value = (
+                bar.value()
+                + max(
+                    80,
+                    self.scroll.viewport().height()
+                    - 50,
+                )
+            )
+
+            if new_value >= bar.maximum():
+                self.go_next()
+            else:
+                bar.setValue(
+                    new_value
+                )
+
+            return
+
+        target = (
+            self.current_page
+            + self.page_step()
+        )
+
+        if target >= len(
+            self.page_pixmaps
+        ):
+            self.go_next()
+            return
+
+        self.current_page = target
+        self.render_current_mode()
+
+    def previous_page(self):
+        if self.reader_mode == "Vertical":
+            bar = self.scroll.verticalScrollBar()
+            new_value = (
+                bar.value()
+                - max(
+                    80,
+                    self.scroll.viewport().height()
+                    - 50,
+                )
+            )
+
+            if (
+                new_value <= 0
+                and bar.value() == 0
+            ):
+                self.go_previous()
+            else:
+                bar.setValue(
+                    max(
+                        0,
+                        new_value,
+                    )
+                )
+
+            return
+
+        target = (
+            self.current_page
+            - self.page_step()
+        )
+
+        if target < 0:
+            self.go_previous()
+            return
+
+        self.current_page = target
+        self.render_current_mode()
+
+    def handle_page_click(
+        self,
+        side,
+    ):
+        rtl = (
+            self.reading_direction
+            == "Derecha → izquierda"
+        )
+
+        if rtl:
+            if side == "left":
+                self.next_page()
+            else:
+                self.previous_page()
+        else:
+            if side == "right":
+                self.next_page()
+            else:
+                self.previous_page()
+
+    # ========================================================
+    # Preferencias del lector
+    # ========================================================
+
+    def change_reader_mode(
+        self,
+        mode,
+    ):
+        self.reader_mode = mode
+
+        self.settings.setValue(
+            "reader/mode",
+            mode,
+        )
+
+        self.current_page = 0
+        self.render_current_mode()
+
+    def change_direction(
+        self,
+        direction,
+    ):
+        self.reading_direction = direction
+
+        self.settings.setValue(
+            "reader/direction",
+            direction,
+        )
+
+        self.render_current_mode()
+
+    def change_fit_mode(
+        self,
+        mode,
+    ):
+        self.fit_mode = mode
+
+        self.settings.setValue(
+            "reader/fit",
+            mode,
+        )
+
+        self.render_current_mode()
+
+    def change_zoom(
+        self,
+        delta,
+    ):
+        self.zoom_factor = max(
+            0.3,
+            min(
+                3.0,
+                self.zoom_factor + delta,
+            ),
+        )
+
+        self.zoom_label.setText(
+            f"{int(self.zoom_factor * 100)}%"
+        )
+
+        self.render_current_mode()
+
+    def reset_zoom(self):
+        self.zoom_factor = 1.0
+
+        self.zoom_label.setText(
+            "100%"
+        )
+
+        self.render_current_mode()
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    # ========================================================
+    # Teclado / ratón
+    # ========================================================
+
+    def keyPressEvent(
+        self,
+        event,
+    ):
+        key = event.key()
+        modifiers = event.modifiers()
+
+        if key == Qt.Key_F11:
+            self.toggle_fullscreen()
+            return
+
+        if key == Qt.Key_Escape:
+            if self.isFullScreen():
+                self.showNormal()
+                return
+
+        if key in {
+            Qt.Key_Plus,
+            Qt.Key_Equal,
+        }:
+            self.change_zoom(
+                0.1
+            )
+            return
+
+        if key == Qt.Key_Minus:
+            self.change_zoom(
+                -0.1
+            )
+            return
+
+        if key == Qt.Key_0:
+            self.reset_zoom()
+            return
+
+        if key == Qt.Key_Home:
+            if self.reader_mode == "Vertical":
+                self.scroll.verticalScrollBar().setValue(
+                    0
+                )
+            else:
+                self.current_page = 0
+                self.render_current_mode()
+            return
+
+        if key == Qt.Key_End:
+            if self.reader_mode == "Vertical":
+                bar = self.scroll.verticalScrollBar()
+                bar.setValue(
+                    bar.maximum()
+                )
+            else:
+                step = self.page_step()
+                self.current_page = (
+                    (
+                        len(self.page_pixmaps) - 1
+                    )
+                    // step
+                    * step
+                )
+                self.render_current_mode()
+            return
+
+        if key in {
+            Qt.Key_PageDown,
+            Qt.Key_Space,
+        }:
+            self.next_page()
+            return
+
+        if key == Qt.Key_PageUp:
+            self.previous_page()
+            return
+
+        if key in {
+            Qt.Key_Left,
+            Qt.Key_Right,
+        }:
+            rtl = (
+                self.reading_direction
+                == "Derecha → izquierda"
+            )
+
+            if key == Qt.Key_Left:
+                (
+                    self.next_page()
+                    if rtl
+                    else self.previous_page()
+                )
+            else:
+                (
+                    self.previous_page()
+                    if rtl
+                    else self.next_page()
+                )
+            return
+
+        super().keyPressEvent(
+            event
+        )
+
+    def eventFilter(
+        self,
+        watched,
+        event,
+    ):
+        if (
+            watched
+            is self.scroll.viewport()
+            and event.type()
+            == QEvent.Type.Wheel
+            and event.modifiers()
+            & Qt.ControlModifier
+        ):
+            delta = (
+                0.1
+                if event.angleDelta().y() > 0
+                else -0.1
+            )
+
+            self.change_zoom(
+                delta
+            )
+
+            return True
+
+        return super().eventFilter(
+            watched,
+            event,
+        )
+
+    def resizeEvent(
+        self,
+        event,
+    ):
+        super().resizeEvent(
+            event
+        )
+
+        if hasattr(
+            self,
+            "page_pixmaps",
+        ) and self.page_pixmaps:
+            QTimer.singleShot(
+                60,
+                self.render_current_mode,
+            )
+
+    # ========================================================
+    # Estilo
     # ========================================================
 
     def apply_styles(self):
@@ -2746,7 +3829,8 @@ class ChapterReader(QDialog):
                 font-size: 14px;
             }
 
-            #readerNavBar {
+            #readerNavBar,
+            #readerTools {
                 background-color: #151519;
                 border-bottom: 1px solid #2e2e36;
             }
@@ -2755,25 +3839,22 @@ class ChapterReader(QDialog):
                 background-color: #202027;
                 border: 1px solid #3b3b45;
                 border-radius: 9px;
-                padding: 9px 20px;
-                font-size: 15px;
+                padding: 8px 18px;
                 font-weight: bold;
-                color: #eeeeee;
             }
 
-            #chapterArrow {
-                border: 1px solid #4a4a56;
-                border-radius: 9px;
+            #chapterArrow,
+            #readerSmallButton {
+                border: 1px solid #42424d;
+                border-radius: 8px;
                 background-color: #292931;
-                color: #eeeeee;
-                font-size: 15px;
+                padding: 8px 11px;
                 font-weight: bold;
-                text-align: center;
-                padding: 0;
             }
 
-            #chapterArrow:hover {
-                background-color: #3a3a44;
+            #chapterArrow:hover,
+            #readerSmallButton:hover {
+                background-color: #383843;
             }
 
             #chapterArrow:disabled {
@@ -2781,20 +3862,20 @@ class ChapterReader(QDialog):
                 background-color: #1b1b20;
             }
 
+            #readerZoom {
+                color: #bdbdc7;
+            }
+
             #readerError {
                 color: #d6a0a0;
                 padding: 30px;
             }
 
-            QPushButton {
-                border: none;
-                border-radius: 8px;
-                padding: 9px 12px;
+            QComboBox {
                 background-color: #292931;
-            }
-
-            QPushButton:hover {
-                background-color: #353540;
+                border: 1px solid #3a3a45;
+                border-radius: 7px;
+                padding: 7px 10px;
             }
 
             QScrollArea {
@@ -2813,7 +3894,6 @@ class ChapterReader(QDialog):
                 min-height: 30px;
             }
         """)
-
 
 
 # ============================================================
@@ -3055,7 +4135,7 @@ class MangaDetails(QDialog):
         )
 
         self.chapter_list.setSelectionMode(
-            QAbstractItemView.SingleSelection
+            QAbstractItemView.ExtendedSelection
         )
 
         self.chapter_list.setContextMenuPolicy(
@@ -3077,6 +4157,52 @@ class MangaDetails(QDialog):
         self.root.addWidget(
             self.chapter_list,
             1,
+        )
+
+        bulk_row = QHBoxLayout()
+
+        mark_read = QPushButton(
+            "Marcar todo como leído"
+        )
+        mark_unread = QPushButton(
+            "Marcar todo como no leído"
+        )
+        delete_selected = QPushButton(
+            "Eliminar seleccionados"
+        )
+        delete_selected.setObjectName(
+            "dangerButton"
+        )
+
+        mark_read.clicked.connect(
+            lambda:
+                self.mark_all_chapters(
+                    True
+                )
+        )
+        mark_unread.clicked.connect(
+            lambda:
+                self.mark_all_chapters(
+                    False
+                )
+        )
+        delete_selected.clicked.connect(
+            self.bulk_delete_selected
+        )
+
+        bulk_row.addWidget(
+            mark_read
+        )
+        bulk_row.addWidget(
+            mark_unread
+        )
+        bulk_row.addStretch()
+        bulk_row.addWidget(
+            delete_selected
+        )
+
+        self.root.addLayout(
+            bulk_row
         )
 
         hint = QLabel(
@@ -3364,11 +4490,24 @@ class MangaDetails(QDialog):
                 chapter[6]
             )
 
-            display_title = (
-                f"✓  {title}"
-                if is_read
-                else f"   {title}"
+            is_new = bool(
+                chapter[7]
+                if len(chapter) > 7
+                else False
             )
+
+            if is_read:
+                display_title = (
+                    f"✓  {title}"
+                )
+            elif is_new:
+                display_title = (
+                    f"● Nuevo   {title}"
+                )
+            else:
+                display_title = (
+                    f"   {title}"
+                )
 
             item = QListWidgetItem(
                 display_title
@@ -3526,6 +4665,67 @@ class MangaDetails(QDialog):
                     Qt.white
                 )
 
+    def selected_chapter_ids(self):
+        return [
+            item.data(
+                Qt.UserRole
+            )
+            for item in self.chapter_list.selectedItems()
+            if item.data(
+                Qt.UserRole
+            )
+        ]
+
+    def mark_all_chapters(
+        self,
+        is_read,
+    ):
+        chapters = self.database.get_chapters(
+            self.manga_id
+        )
+
+        ids = [
+            chapter[0]
+            for chapter in chapters
+        ]
+
+        if not ids:
+            return
+
+        self.database.set_chapters_read_bulk(
+            ids,
+            is_read,
+        )
+
+        self.refresh_chapters()
+
+    def bulk_delete_selected(self):
+        ids = self.selected_chapter_ids()
+
+        if not ids:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Eliminar capítulos",
+            (
+                f"¿Eliminar los {len(ids)} capítulos seleccionados?\n\n"
+                "Esta acción no elimina las carpetas originales."
+            ),
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        self.database.delete_chapters_bulk(
+            ids
+        )
+
+        self.refresh_chapters()
+
     def change_reading_state(
         self,
         state,
@@ -3559,6 +4759,11 @@ class MangaDetails(QDialog):
             self.manga_id,
             chapter_id,
             0,
+        )
+
+        self.database.set_chapter_new(
+            chapter_id,
+            False,
         )
 
         reader = ChapterReader(
@@ -3719,11 +4924,106 @@ class SettingsDialog(QDialog):
             section
         )
 
+        manga_tools = QHBoxLayout()
+        manga_tools.setSpacing(
+            8
+        )
+
+        self.manga_search = QLineEdit()
+        self.manga_search.setPlaceholderText(
+            "Buscar manga..."
+        )
+        self.manga_search.setClearButtonEnabled(
+            True
+        )
+        self.manga_search.textChanged.connect(
+            self.filter_manga_list
+        )
+
+        self.list_view_button = QPushButton(
+            "☰  Lista"
+        )
+        self.list_view_button.setObjectName(
+            "viewModeButton"
+        )
+        self.list_view_button.setProperty(
+            "selectedView",
+            True,
+        )
+        self.list_view_button.clicked.connect(
+            lambda:
+                self.set_manga_view_mode(
+                    "list"
+                )
+        )
+
+        self.grid_view_button = QPushButton(
+            "▦  Cuadrícula"
+        )
+        self.grid_view_button.setObjectName(
+            "viewModeButton"
+        )
+        self.grid_view_button.setProperty(
+            "selectedView",
+            False,
+        )
+        self.grid_view_button.clicked.connect(
+            lambda:
+                self.set_manga_view_mode(
+                    "grid"
+                )
+        )
+
+        manga_tools.addWidget(
+            self.manga_search,
+            1,
+        )
+        manga_tools.addWidget(
+            self.list_view_button
+        )
+        manga_tools.addWidget(
+            self.grid_view_button
+        )
+
+        root.addLayout(
+            manga_tools
+        )
+
         self.manga_list = QListWidget()
+        self.manga_list.setObjectName(
+            "settingsMangaList"
+        )
+        self.manga_list.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self.manga_list.setResizeMode(
+            QListView.Adjust
+        )
+        self.manga_list.setUniformItemSizes(
+            False
+        )
+        self.manga_list.setWordWrap(
+            True
+        )
+
+        self.settings = QSettings(
+            APP_ORG,
+            APP_NAME,
+        )
+
+        saved_view = self.settings.value(
+            "settings/manga_view",
+            "list",
+        )
 
         root.addWidget(
             self.manga_list,
             1,
+        )
+
+        self.set_manga_view_mode(
+            saved_view,
+            save=False,
         )
 
         buttons = QHBoxLayout()
@@ -3734,6 +5034,18 @@ class SettingsDialog(QDialog):
 
         add_chapter = QPushButton(
             "Agregar capítulo"
+        )
+
+        import_chapters = QPushButton(
+            "Importar capítulos"
+        )
+
+        link_folder = QPushButton(
+            "Vincular carpeta"
+        )
+
+        sync_folder = QPushButton(
+            "Buscar nuevos"
         )
 
         remove_chapter = QPushButton(
@@ -3756,6 +5068,18 @@ class SettingsDialog(QDialog):
             self.add_chapter
         )
 
+        import_chapters.clicked.connect(
+            self.import_chapter_folders
+        )
+
+        link_folder.clicked.connect(
+            self.link_source_folder
+        )
+
+        sync_folder.clicked.connect(
+            self.sync_source_folder
+        )
+
         remove_chapter.clicked.connect(
             self.delete_chapter
         )
@@ -3773,6 +5097,18 @@ class SettingsDialog(QDialog):
         )
 
         buttons.addWidget(
+            import_chapters
+        )
+
+        buttons.addWidget(
+            link_folder
+        )
+
+        buttons.addWidget(
+            sync_folder
+        )
+
+        buttons.addWidget(
             remove_chapter
         )
 
@@ -3784,13 +5120,61 @@ class SettingsDialog(QDialog):
             buttons
         )
 
+        backup_row = QHBoxLayout()
+
+        export_backup = QPushButton(
+            "Exportar respaldo"
+        )
+
+        import_backup = QPushButton(
+            "Importar respaldo"
+        )
+
+        export_backup.clicked.connect(
+            self.export_backup
+        )
+
+        import_backup.clicked.connect(
+            self.import_backup
+        )
+
+        backup_row.addWidget(
+            export_backup
+        )
+        backup_row.addWidget(
+            import_backup
+        )
+        backup_row.addStretch()
+
+        root.addLayout(
+            backup_row
+        )
+
         self.reload()
         self.apply_styles()
 
     def reload(self):
+        current_id = None
+
+        current_item = self.manga_list.currentItem()
+
+        if current_item:
+            current_id = current_item.data(
+                Qt.UserRole
+            )
+
         self.manga_list.clear()
 
-        for manga in self.database.get_manga():
+        mangas = self.database.get_manga()
+
+        mangas.sort(
+            key=lambda manga:
+                natural_sort_key(
+                    manga[1]
+                )
+        )
+
+        for manga in mangas:
             item = QListWidgetItem(
                 manga[1]
             )
@@ -3800,8 +5184,170 @@ class SettingsDialog(QDialog):
                 manga[0],
             )
 
+            item.setData(
+                Qt.UserRole + 1,
+                manga[1].casefold(),
+            )
+
+            cover = (
+                manga[2]
+                if len(manga) > 2
+                else ""
+            )
+
+            if (
+                cover
+                and Path(cover).exists()
+            ):
+                item.setIcon(
+                    QIcon(
+                        str(cover)
+                    )
+                )
+
             self.manga_list.addItem(
                 item
+            )
+
+            if manga[0] == current_id:
+                self.manga_list.setCurrentItem(
+                    item
+                )
+
+        self.filter_manga_list(
+            self.manga_search.text()
+            if hasattr(
+                self,
+                "manga_search",
+            )
+            else ""
+        )
+
+    def filter_manga_list(
+        self,
+        text,
+    ):
+        query = (
+            text.strip().casefold()
+        )
+
+        for index in range(
+            self.manga_list.count()
+        ):
+            item = self.manga_list.item(
+                index
+            )
+
+            searchable = item.data(
+                Qt.UserRole + 1
+            )
+
+            if not searchable:
+                searchable = (
+                    item.text().casefold()
+                )
+
+            item.setHidden(
+                bool(query)
+                and query not in searchable
+            )
+
+    def set_manga_view_mode(
+        self,
+        mode,
+        save=True,
+    ):
+        if mode not in {
+            "list",
+            "grid",
+        }:
+            mode = "list"
+
+        if mode == "grid":
+            self.manga_list.setViewMode(
+                QListView.IconMode
+            )
+            self.manga_list.setFlow(
+                QListView.LeftToRight
+            )
+            self.manga_list.setWrapping(
+                True
+            )
+            self.manga_list.setMovement(
+                QListView.Static
+            )
+            self.manga_list.setIconSize(
+                QSize(
+                    82,
+                    118,
+                )
+            )
+            self.manga_list.setGridSize(
+                QSize(
+                    122,
+                    158,
+                )
+            )
+            self.manga_list.setSpacing(
+                6
+            )
+            self.manga_list.setTextElideMode(
+                Qt.ElideRight
+            )
+        else:
+            self.manga_list.setViewMode(
+                QListView.ListMode
+            )
+            self.manga_list.setFlow(
+                QListView.TopToBottom
+            )
+            self.manga_list.setWrapping(
+                False
+            )
+            self.manga_list.setMovement(
+                QListView.Static
+            )
+            self.manga_list.setIconSize(
+                QSize(
+                    34,
+                    48,
+                )
+            )
+            self.manga_list.setGridSize(
+                QSize()
+            )
+            self.manga_list.setSpacing(
+                2
+            )
+            self.manga_list.setTextElideMode(
+                Qt.ElideRight
+            )
+
+        self.list_view_button.setProperty(
+            "selectedView",
+            mode == "list",
+        )
+        self.grid_view_button.setProperty(
+            "selectedView",
+            mode == "grid",
+        )
+
+        for button in (
+            self.list_view_button,
+            self.grid_view_button,
+        ):
+            button.style().unpolish(
+                button
+            )
+            button.style().polish(
+                button
+            )
+            button.update()
+
+        if save:
+            self.settings.setValue(
+                "settings/manga_view",
+                mode,
             )
 
     def selected_manga(self):
@@ -3903,6 +5449,298 @@ class SettingsDialog(QDialog):
             data["title"],
             data["content_type"],
             data["content"],
+        )
+
+    def import_chapter_folders(self):
+        manga = self.selected_manga()
+
+        if not manga:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "Selecciona primero un manga.",
+            )
+            return
+
+        picker = FilePickerDialog(
+            self,
+            "folder",
+        )
+
+        parent_folder = picker.get_folder()
+
+        if not parent_folder:
+            return
+
+        found = scan_chapter_folders(
+            parent_folder
+        )
+
+        if not found:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                (
+                    "No encontré subcarpetas con imágenes compatibles.\n\n"
+                    "Selecciona una carpeta que contenga carpetas "
+                    "como Cap 001, Cap 002, Cap 003, etc."
+                ),
+            )
+            return
+
+        existing_titles = {
+            chapter[2].strip().casefold()
+            for chapter in self.database.get_chapters(
+                manga[0]
+            )
+        }
+
+        new_count = sum(
+            1
+            for title, _ in found
+            if title.strip().casefold()
+            not in existing_titles
+        )
+
+        if new_count == 0:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "Todos los capítulos encontrados ya existen.",
+            )
+            self.database.set_manga_source_folder(
+                manga[0],
+                parent_folder,
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Importar capítulos",
+            (
+                f"Se encontraron {new_count} capítulos nuevos.\n\n"
+                "¿Quieres importarlos todos y vincular esta carpeta "
+                "para futuras actualizaciones?"
+            ),
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        imported, skipped, total = import_new_chapter_folders(
+            self.database,
+            manga[0],
+            parent_folder,
+            mark_new=True,
+        )
+
+        self.database.set_manga_source_folder(
+            manga[0],
+            parent_folder,
+        )
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            (
+                f"Importados: {imported}\n"
+                f"Ya existentes: {skipped}\n\n"
+                "La carpeta quedó vinculada."
+            ),
+        )
+
+    def link_source_folder(self):
+        manga = self.selected_manga()
+
+        if not manga:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "Selecciona primero un manga.",
+            )
+            return
+
+        picker = FilePickerDialog(
+            self,
+            "folder",
+        )
+
+        folder = picker.get_folder()
+
+        if not folder:
+            return
+
+        self.database.set_manga_source_folder(
+            manga[0],
+            folder,
+        )
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            (
+                "Carpeta vinculada correctamente.\n\n"
+                "Usa “Buscar nuevos” cuando agregues más capítulos."
+            ),
+        )
+
+    def sync_source_folder(self):
+        manga = self.selected_manga()
+
+        if not manga:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "Selecciona primero un manga.",
+            )
+            return
+
+        folder = self.database.get_manga_source_folder(
+            manga[0]
+        )
+
+        if not folder:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                (
+                    "Este manga todavía no tiene una carpeta vinculada.\n\n"
+                    "Usa “Vincular carpeta” primero."
+                ),
+            )
+            return
+
+        if not Path(folder).exists():
+            QMessageBox.warning(
+                self,
+                "Manga Reader",
+                (
+                    "La carpeta vinculada ya no existe o el disco no está montado:\n\n"
+                    f"{folder}"
+                ),
+            )
+            return
+
+        imported, skipped, total = import_new_chapter_folders(
+            self.database,
+            manga[0],
+            folder,
+            mark_new=True,
+        )
+
+        if imported == 0:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "No se encontraron capítulos nuevos.",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            (
+                f"Se agregaron {imported} capítulos nuevos.\n\n"
+                "Aparecerán marcados como “Nuevo” hasta que los abras."
+            ),
+        )
+
+    def export_backup(self):
+        picker = FilePickerDialog(
+            self,
+            "folder",
+        )
+
+        folder = picker.get_folder()
+
+        if not folder:
+            return
+
+        filename = (
+            "manga-reader-backup-"
+            + datetime.now().strftime(
+                "%Y%m%d-%H%M%S"
+            )
+            + ".json"
+        )
+
+        destination = Path(
+            folder
+        ) / filename
+
+        try:
+            self.database.export_backup(
+                destination
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Manga Reader",
+                f"No se pudo crear el respaldo:\n{error}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            (
+                "Respaldo creado correctamente:\n\n"
+                f"{destination}\n\n"
+                "El respaldo guarda biblioteca y estados, "
+                "pero no copia las imágenes/PDF originales."
+            ),
+        )
+
+    def import_backup(self):
+        picker = FilePickerDialog(
+            self,
+            "backup",
+        )
+
+        files = picker.get_files()
+
+        if not files:
+            return
+
+        file_path = files[0]
+
+        answer = QMessageBox.warning(
+            self,
+            "Importar respaldo",
+            (
+                "Esto reemplazará la biblioteca actual por la del respaldo.\n\n"
+                "Los archivos originales de manga no serán borrados.\n\n"
+                "¿Continuar?"
+            ),
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            self.database.import_backup(
+                file_path
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Manga Reader",
+                f"No se pudo importar el respaldo:\n{error}",
+            )
+            return
+
+        self.reload()
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            "Respaldo importado correctamente.",
         )
 
     def delete_chapter(self):
@@ -4090,6 +5928,41 @@ class SettingsDialog(QDialog):
                 font-weight: bold;
             }
 
+            QLineEdit {
+                background-color: #202027;
+                border: 1px solid #34343d;
+                border-radius: 8px;
+                padding: 9px 11px;
+            }
+
+            #settingsMangaList {
+                padding: 6px;
+            }
+
+            #settingsMangaList::item {
+                border-radius: 7px;
+                padding: 6px;
+            }
+
+            #settingsMangaList::item:hover {
+                background-color: #292931;
+            }
+
+            #settingsMangaList::item:selected {
+                background-color: #6657df;
+                color: white;
+            }
+
+            #viewModeButton {
+                padding: 8px 12px;
+            }
+
+            #viewModeButton[selectedView="true"] {
+                background-color: #6657df;
+                color: white;
+                border: 1px solid #7c70ee;
+            }
+
             #sectionTitle {
                 font-size: 18px;
                 font-weight: bold;
@@ -4185,6 +6058,7 @@ class MangaCard(QFrame):
         manga,
         open_callback,
         continue_label=None,
+        new_count=0,
     ):
         super().__init__()
 
@@ -4299,6 +6173,25 @@ class MangaCard(QFrame):
                 chapter_label
             )
 
+        if new_count:
+            new_label = QLabel(
+                f"{new_count} nuevo"
+                if new_count == 1
+                else f"{new_count} nuevos"
+            )
+
+            new_label.setAlignment(
+                Qt.AlignCenter
+            )
+
+            new_label.setObjectName(
+                "newChapterBadge"
+            )
+
+            layout.addWidget(
+                new_label
+            )
+
 
 # ============================================================
 # VENTANA PRINCIPAL
@@ -4309,6 +6202,10 @@ class MangaReader(QMainWindow):
         super().__init__()
 
         self.database = Database()
+
+        self.setAcceptDrops(
+            True
+        )
 
         self.current_filter = "all"
         self.sidebar_open = True
@@ -4588,6 +6485,16 @@ class MangaReader(QMainWindow):
                 "filterButton"
             )
 
+            button.setProperty(
+                "filterKey",
+                key,
+            )
+
+            button.setProperty(
+                "selectedFilter",
+                False,
+            )
+
             button.clicked.connect(
                 lambda checked=False, filter_key=key:
                     self.set_filter(
@@ -4704,6 +6611,25 @@ class MangaReader(QMainWindow):
             not self.sidebar_open
         )
 
+    def update_filter_button_styles(self):
+        for key, button in self.filter_buttons.items():
+            selected = (
+                key == self.current_filter
+            )
+
+            button.setProperty(
+                "selectedFilter",
+                selected,
+            )
+
+            button.style().unpolish(
+                button
+            )
+            button.style().polish(
+                button
+            )
+            button.update()
+
     def set_filter(
         self,
         filter_name,
@@ -4727,6 +6653,7 @@ class MangaReader(QMainWindow):
             )
         )
 
+        self.update_filter_button_styles()
         self.refresh_library()
 
     def open_settings(self):
@@ -4752,6 +6679,155 @@ class MangaReader(QMainWindow):
         dialog.exec()
 
         self.refresh_library()
+
+    def dragEnterEvent(
+        self,
+        event,
+    ):
+        urls = event.mimeData().urls()
+
+        if any(
+            Path(url.toLocalFile()).is_dir()
+            for url in urls
+            if url.isLocalFile()
+        ):
+            event.acceptProposedAction()
+            return
+
+        super().dragEnterEvent(
+            event
+        )
+
+    def dropEvent(
+        self,
+        event,
+    ):
+        folders = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if (
+                url.isLocalFile()
+                and Path(
+                    url.toLocalFile()
+                ).is_dir()
+            )
+        ]
+
+        if not folders:
+            return
+
+        mangas = self.database.get_manga()
+
+        if not mangas:
+            QMessageBox.information(
+                self,
+                "Manga Reader",
+                "Primero crea un manga.",
+            )
+            return
+
+        titles = [
+            manga[1]
+            for manga in mangas
+        ]
+
+        title, accepted = QInputDialog.getItem(
+            self,
+            "Importar carpetas",
+            "¿A qué manga quieres agregar estas carpetas?",
+            titles,
+            0,
+            False,
+        )
+
+        if not accepted:
+            return
+
+        manga = next(
+            (
+                item
+                for item in mangas
+                if item[1] == title
+            ),
+            None,
+        )
+
+        if not manga:
+            return
+
+        imported_total = 0
+
+        # Si se arrastra una carpeta padre, escaneamos sus subcarpetas.
+        # Si se arrastran capítulos individuales, importamos cada carpeta.
+        for folder in folders:
+            children = scan_chapter_folders(
+                folder
+            )
+
+            if children:
+                imported, _, _ = import_new_chapter_folders(
+                    self.database,
+                    manga[0],
+                    folder,
+                    mark_new=True,
+                )
+                imported_total += imported
+
+                self.database.set_manga_source_folder(
+                    manga[0],
+                    str(folder),
+                )
+                continue
+
+            images = [
+                str(path)
+                for path in folder.iterdir()
+                if (
+                    path.is_file()
+                    and path.suffix.lower()
+                    in IMAGE_EXTENSIONS
+                )
+            ]
+
+            if not images:
+                continue
+
+            existing = {
+                chapter[2].strip().casefold()
+                for chapter in self.database.get_chapters(
+                    manga[0]
+                )
+            }
+
+            if folder.name.strip().casefold() in existing:
+                continue
+
+            self.database.add_chapter(
+                manga[0],
+                folder.name,
+                "images",
+                sorted(
+                    images,
+                    key=natural_sort_key,
+                ),
+                is_new=True,
+            )
+
+            imported_total += 1
+
+        self.refresh_library()
+
+        QMessageBox.information(
+            self,
+            "Manga Reader",
+            (
+                f"Se importaron {imported_total} capítulos."
+                if imported_total
+                else "No se encontraron capítulos nuevos."
+            ),
+        )
+
+        event.acceptProposedAction()
 
     def network_placeholder(self):
         QMessageBox.information(
@@ -4951,6 +7027,9 @@ class MangaReader(QMainWindow):
                 manga,
                 self.open_manga,
                 continue_label,
+                self.database.get_new_chapter_count(
+                    manga[0]
+                ),
             )
 
             self.grid.addWidget(
@@ -5102,6 +7181,34 @@ class MangaReader(QMainWindow):
 
             #filterButton:hover {
                 background-color: #292931;
+            }
+
+            #filterButton[selectedFilter="true"] {
+                border-radius: 8px;
+            }
+
+            #filterButton[selectedFilter="true"][filterKey="continue"] {
+                background-color: #173c2a;
+                color: #70d99b;
+                border: 1px solid #2e7650;
+            }
+
+            #filterButton[selectedFilter="true"][filterKey="favorite"] {
+                background-color: #451c35;
+                color: #ff9ad5;
+                border: 1px solid #7f3b66;
+            }
+
+            #filterButton[selectedFilter="true"][filterKey="reading"] {
+                background-color: #172e49;
+                color: #7db8ff;
+                border: 1px solid #315f91;
+            }
+
+            #filterButton[selectedFilter="true"][filterKey="finished"] {
+                background-color: #421d22;
+                color: #ff8b94;
+                border: 1px solid #7f3941;
             }
 
             #mangaCard {
