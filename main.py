@@ -96,6 +96,40 @@ def clear_layout(layout):
             clear_layout(child_layout)
 
 
+def fit_cover_pixmap(
+    pixmap,
+    target_size,
+):
+    """
+    Llena completamente el cuadro de portada sin deformar la imagen.
+    Mantiene proporción y recorta de forma centrada lo que sobre.
+    """
+    if pixmap.isNull():
+        return pixmap
+
+    scaled = pixmap.scaled(
+        target_size,
+        Qt.KeepAspectRatioByExpanding,
+        Qt.SmoothTransformation,
+    )
+
+    x = max(
+        0,
+        (scaled.width() - target_size.width()) // 2,
+    )
+    y = max(
+        0,
+        (scaled.height() - target_size.height()) // 2,
+    )
+
+    return scaled.copy(
+        x,
+        y,
+        target_size.width(),
+        target_size.height(),
+    )
+
+
 def scan_chapter_folders(parent_folder):
     """
     Devuelve [(nombre_capitulo, [imagenes...]), ...] de las
@@ -1048,51 +1082,79 @@ class Database:
 
     def get_continue_manga(self):
         """
-        Continuar muestra mangas que ya fueron empezados y todavía
-        tienen capítulos sin leer.
+        Continuar muestra un manga cuando ya fue empezado y todavía
+        tiene capítulos pendientes.
 
-        La tarjeta muestra el PRIMER capítulo pendiente, no el último
-        capítulo guardado en progress. Así, si 1 y 2 están leídos y
-        el 3 no, Continuar mostrará "Capítulo 3".
+        Se considera empezado si:
+        - se abrió algún capítulo (existe progreso), o
+        - existe al menos un capítulo marcado como leído.
+
+        Así no es necesario abrir un capítulo para que aparezca
+        en Continuar: basta con marcar capítulos manualmente.
         """
 
-        cursor = self.connection.cursor()
+        result = []
 
-        cursor.execute("""
-            SELECT
-                m.id,
-                m.title,
-                m.cover,
-                m.synopsis,
-                m.genres,
-                m.status,
-                m.favorite,
-                m.reading_state,
-                pending.title,
-                pending.position
+        for manga in self.get_manga():
+            manga_id = manga[0]
 
-            FROM manga m
+            chapters = self.get_chapters(
+                manga_id,
+                reverse=False,
+            )
 
-            JOIN progress p
-                ON p.manga_id = m.id
+            if not chapters:
+                continue
 
-            JOIN chapters pending
-                ON pending.id = (
-                    SELECT c2.id
-                    FROM chapters c2
-                    WHERE
-                        c2.manga_id = m.id
-                        AND c2.is_read = 0
-                    ORDER BY
-                        c2.position ASC,
-                        c2.id ASC
-                    LIMIT 1
+            has_read_chapter = any(
+                bool(chapter[6])
+                for chapter in chapters
+            )
+
+            has_progress = (
+                self.get_progress(
+                    manga_id
                 )
+                is not None
+            )
 
-            ORDER BY m.title COLLATE NOCASE
-        """)
+            if not (
+                has_read_chapter
+                or has_progress
+            ):
+                continue
 
-        return cursor.fetchall()
+            pending = next(
+                (
+                    chapter
+                    for chapter in chapters
+                    if not bool(
+                        chapter[6]
+                    )
+                ),
+                None,
+            )
+
+            if pending is None:
+                continue
+
+            result.append(
+                tuple(manga[:8])
+                + (
+                    pending[2],
+                    pending[5],
+                )
+            )
+
+        result.sort(
+            key=lambda row:
+                natural_sort_key(
+                    row[1]
+                )
+        )
+
+        return result
+
 
 
 # ============================================================
@@ -2139,10 +2201,9 @@ class MangaEditor(QDialog):
             return
 
         self.cover_preview.setPixmap(
-            pixmap.scaled(
+            fit_cover_pixmap(
+                pixmap,
                 self.cover_preview.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
             )
         )
 
@@ -2658,6 +2719,9 @@ class ChapterReader(QDialog):
         self.content_type = ""
         self.content = []
         self.page_pixmaps = []
+        self.page_sources = []
+        self.page_cache = {}
+        self.vertical_labels = []
         self.current_page = 0
         self.zoom_factor = 1.0
 
@@ -2930,6 +2994,10 @@ class ChapterReader(QDialog):
             self
         )
 
+        self.scroll.verticalScrollBar().valueChanged.connect(
+            self.schedule_visible_page_load
+        )
+
         self.reader_widget = QWidget()
         self.reader_layout = QVBoxLayout(
             self.reader_widget
@@ -3087,9 +3155,24 @@ class ChapterReader(QDialog):
         )
 
         self.current_page = 0
-        self.page_pixmaps = (
-            self.load_all_pages()
-        )
+        self.page_cache.clear()
+        self.vertical_labels = []
+
+        if self.content_type == "images":
+            self.page_sources = [
+                str(path)
+                for path in sorted(
+                    self.content,
+                    key=natural_sort_key,
+                )
+                if Path(path).exists()
+            ]
+            self.page_pixmaps = []
+        else:
+            self.page_sources = []
+            self.page_pixmaps = (
+                self.load_all_pages()
+            )
 
         self.render_current_mode()
         self.update_navigation_buttons()
@@ -3097,6 +3180,152 @@ class ChapterReader(QDialog):
     # ========================================================
     # Carga de páginas
     # ========================================================
+
+    def page_count(self):
+        if self.content_type == "images":
+            return len(
+                self.page_sources
+            )
+
+        return len(
+            self.page_pixmaps
+        )
+
+    def get_page_pixmap(
+        self,
+        index,
+    ):
+        if (
+            index < 0
+            or index >= self.page_count()
+        ):
+            return QPixmap()
+
+        if self.content_type != "images":
+            return self.page_pixmaps[
+                index
+            ]
+
+        if index in self.page_cache:
+            return self.page_cache[
+                index
+            ]
+
+        pixmap = QPixmap(
+            self.page_sources[
+                index
+            ]
+        )
+
+        if not pixmap.isNull():
+            self.page_cache[
+                index
+            ] = pixmap
+
+            if len(self.page_cache) > 10:
+                protected = {
+                    index,
+                    self.current_page,
+                    self.current_page + 1,
+                }
+
+                for cached_index in list(
+                    self.page_cache.keys()
+                ):
+                    if cached_index not in protected:
+                        self.page_cache.pop(
+                            cached_index,
+                            None,
+                        )
+
+                    if len(
+                        self.page_cache
+                    ) <= 8:
+                        break
+
+        return pixmap
+
+    def schedule_visible_page_load(
+        self,
+        *_,
+    ):
+        if (
+            self.reader_mode != "Vertical"
+            or not self.vertical_labels
+        ):
+            return
+
+        QTimer.singleShot(
+            0,
+            self.load_visible_vertical_pages,
+        )
+
+    def load_visible_vertical_pages(self):
+        if (
+            self.reader_mode != "Vertical"
+            or not self.vertical_labels
+        ):
+            return
+
+        bar = self.scroll.verticalScrollBar()
+        top = bar.value()
+        height = max(
+            1,
+            self.scroll.viewport().height(),
+        )
+
+        visible_top = max(
+            0,
+            top - height,
+        )
+        visible_bottom = (
+            top
+            + (height * 2)
+        )
+
+        for index, label in enumerate(
+            self.vertical_labels
+        ):
+            geometry = label.geometry()
+            page_top = geometry.top()
+            page_bottom = geometry.bottom()
+
+            if (
+                page_bottom < visible_top
+                or page_top > visible_bottom
+            ):
+                continue
+
+            if label.property(
+                "pageLoaded"
+            ):
+                continue
+
+            pixmap = self.get_page_pixmap(
+                index
+            )
+
+            if pixmap.isNull():
+                label.setText(
+                    "No se pudo cargar esta página"
+                )
+                continue
+
+            scaled = self.scaled_pixmap(
+                pixmap,
+                1,
+            )
+
+            label.setFixedSize(
+                scaled.size()
+            )
+            label.setPixmap(
+                scaled
+            )
+            label.setProperty(
+                "pageLoaded",
+                True,
+            )
 
     def load_all_pages(self):
         if self.content_type == "images":
@@ -3334,7 +3563,7 @@ class ChapterReader(QDialog):
     def render_current_mode(self):
         self.clear_reader()
 
-        if not self.page_pixmaps:
+        if self.page_count() == 0:
             label = QLabel(
                 "No se encontraron páginas compatibles."
             )
@@ -3361,16 +3590,49 @@ class ChapterReader(QDialog):
         self.scroll.viewport().update()
 
     def render_vertical(self):
-        for pixmap in self.page_pixmaps:
+        self.vertical_labels = []
+
+        viewport_width = max(
+            320,
+            self.scroll.viewport().width()
+            - 50,
+        )
+
+        placeholder_width = max(
+            280,
+            int(
+                viewport_width
+                * self.zoom_factor
+            ),
+        )
+        placeholder_height = max(
+            400,
+            int(
+                placeholder_width
+                * 1.42
+            ),
+        )
+
+        for index in range(
+            self.page_count()
+        ):
             label = ReaderPageLabel(
                 self.handle_page_click
             )
 
-            label.setPixmap(
-                self.scaled_pixmap(
-                    pixmap,
-                    1,
-                )
+            label.setAlignment(
+                Qt.AlignCenter
+            )
+            label.setText(
+                f"Cargando página {index + 1}…"
+            )
+            label.setFixedSize(
+                placeholder_width,
+                placeholder_height,
+            )
+            label.setProperty(
+                "pageLoaded",
+                False,
             )
 
             self.reader_layout.addWidget(
@@ -3379,14 +3641,23 @@ class ChapterReader(QDialog):
                 Qt.AlignHCenter,
             )
 
+            self.vertical_labels.append(
+                label
+            )
+
         self.reader_layout.addStretch()
+
+        QTimer.singleShot(
+            0,
+            self.load_visible_vertical_pages,
+        )
 
     def render_single_page(self):
         self.current_page = max(
             0,
             min(
                 self.current_page,
-                len(self.page_pixmaps) - 1,
+                self.page_count() - 1,
             ),
         )
 
@@ -3396,9 +3667,9 @@ class ChapterReader(QDialog):
 
         label.setPixmap(
             self.scaled_pixmap(
-                self.page_pixmaps[
+                self.get_page_pixmap(
                     self.current_page
-                ],
+                ),
                 1,
             )
         )
@@ -3414,7 +3685,7 @@ class ChapterReader(QDialog):
             0,
             min(
                 self.current_page,
-                len(self.page_pixmaps) - 1,
+                self.page_count() - 1,
             ),
         )
 
@@ -3441,7 +3712,7 @@ class ChapterReader(QDialog):
 
         if (
             self.current_page + 1
-            < len(self.page_pixmaps)
+            < self.page_count()
         ):
             indexes.append(
                 self.current_page + 1
@@ -3462,9 +3733,9 @@ class ChapterReader(QDialog):
 
             label.setPixmap(
                 self.scaled_pixmap(
-                    self.page_pixmaps[
+                    self.get_page_pixmap(
                         index
-                    ],
+                    ),
                     2,
                 )
             )
@@ -3721,7 +3992,7 @@ class ChapterReader(QDialog):
                 step = self.page_step()
                 self.current_page = (
                     (
-                        len(self.page_pixmaps) - 1
+                        self.page_count() - 1
                     )
                     // step
                     * step
@@ -3917,9 +4188,10 @@ class MangaDetails(QDialog):
             "Manga"
         )
 
-        self.resize(
-            920,
-            720,
+        # Tamaño uniforme para todos los mangas.
+        self.setFixedSize(
+            1120,
+            760,
         )
 
         self.root = QVBoxLayout(
@@ -4041,7 +4313,7 @@ class MangaDetails(QDialog):
 
         self.genres_container = QWidget()
 
-        self.genres_layout = QHBoxLayout(
+        self.genres_layout = QGridLayout(
             self.genres_container
         )
 
@@ -4052,12 +4324,16 @@ class MangaDetails(QDialog):
             2,
         )
 
-        self.genres_layout.setSpacing(
+        self.genres_layout.setHorizontalSpacing(
             6
         )
 
-        self.genres_layout.setAlignment(
-            Qt.AlignLeft
+        self.genres_layout.setVerticalSpacing(
+            6
+        )
+
+        self.genres_container.setFixedHeight(
+            102
         )
 
         info.addWidget(
@@ -4065,17 +4341,25 @@ class MangaDetails(QDialog):
         )
 
         self.synopsis_label = QLabel()
-
         self.synopsis_label.setWordWrap(
             True
         )
-
         self.synopsis_label.setTextInteractionFlags(
             Qt.TextSelectableByMouse
         )
+        self.synopsis_label.setAlignment(
+            Qt.AlignTop
+            | Qt.AlignLeft
+        )
+        self.synopsis_label.setFixedHeight(
+            126
+        )
+        self.synopsis_label.setObjectName(
+            "detailSynopsis"
+        )
 
         info.addSpacing(
-            6
+            4
         )
 
         info.addWidget(
@@ -4303,10 +4587,9 @@ class MangaDetails(QDialog):
 
             if not pixmap.isNull():
                 self.cover_label.setPixmap(
-                    pixmap.scaled(
+                    fit_cover_pixmap(
+                        pixmap,
                         self.cover_label.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
                     )
                 )
             else:
@@ -4409,13 +4692,36 @@ class MangaDetails(QDialog):
                 "Sin género"
             ]
 
-        for genre in genres:
+        # Tamaño y distribución uniformes, como en G.A.T.E.
+        columns = min(
+            5,
+            max(
+                1,
+                len(genres),
+            ),
+        )
+
+        for index, genre in enumerate(
+            genres
+        ):
+            row = index // columns
+            column = index % columns
+
             label = QLabel(
                 genre
             )
 
             label.setObjectName(
                 "genreBadge"
+            )
+
+            label.setAlignment(
+                Qt.AlignCenter
+            )
+
+            label.setFixedSize(
+                142,
+                30,
             )
 
             label.setStyleSheet("""
@@ -4429,10 +4735,16 @@ class MangaDetails(QDialog):
             """)
 
             self.genres_layout.addWidget(
-                label
+                label,
+                row,
+                column,
             )
 
-        self.genres_layout.addStretch()
+        self.genres_layout.setAlignment(
+            Qt.AlignLeft
+            | Qt.AlignTop
+        )
+
 
     def change_chapter_order(
         self,
@@ -4806,6 +5118,13 @@ class MangaDetails(QDialog):
             #chapterHint {
                 color: #8f8f9b;
                 font-size: 12px;
+            }
+
+            #detailSynopsis {
+                background: transparent;
+                color: #eeeeee;
+                border: none;
+                padding: 0px;
             }
 
             #favoriteButton {
@@ -5199,11 +5518,22 @@ class SettingsDialog(QDialog):
                 cover
                 and Path(cover).exists()
             ):
-                item.setIcon(
-                    QIcon(
-                        str(cover)
-                    )
+                cover_pixmap = QPixmap(
+                    str(cover)
                 )
+
+                if not cover_pixmap.isNull():
+                    item.setIcon(
+                        QIcon(
+                            fit_cover_pixmap(
+                                cover_pixmap,
+                                QSize(
+                                    82,
+                                    118,
+                                ),
+                            )
+                        )
+                    )
 
             self.manga_list.addItem(
                 item
@@ -6116,10 +6446,9 @@ class MangaCard(QFrame):
 
             if not pixmap.isNull():
                 cover.setPixmap(
-                    pixmap.scaled(
+                    fit_cover_pixmap(
+                        pixmap,
                         cover.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
                     )
                 )
 
@@ -6214,13 +6543,105 @@ class MangaReader(QMainWindow):
             "Manga Reader"
         )
 
-        self.resize(
-            1280,
-            800,
+        self.window_settings = QSettings(
+            APP_ORG,
+            APP_NAME,
         )
+
+        saved_geometry = self.window_settings.value(
+            "main_window/geometry"
+        )
+
+        if saved_geometry:
+            self.restoreGeometry(
+                saved_geometry
+            )
+        else:
+            self.resize(
+                1280,
+                800,
+            )
 
         self.build_ui()
         self.refresh_library()
+
+        if self.window_settings.value(
+            "main_window/maximized",
+            False,
+            type=bool,
+        ):
+            QTimer.singleShot(
+                0,
+                self.showMaximized,
+            )
+
+        # Busca capítulos nuevos automáticamente cada vez
+        # que se abre Manga Reader.
+        QTimer.singleShot(
+            150,
+            self.auto_sync_linked_folders,
+        )
+
+    def closeEvent(
+        self,
+        event,
+    ):
+        self.window_settings.setValue(
+            "main_window/geometry",
+            self.saveGeometry(),
+        )
+
+        self.window_settings.setValue(
+            "main_window/maximized",
+            self.isMaximized(),
+        )
+
+        self.window_settings.sync()
+
+        super().closeEvent(
+            event
+        )
+
+    def auto_sync_linked_folders(self):
+        imported_total = 0
+
+        for manga in self.database.get_manga():
+            manga_id = manga[0]
+
+            folder = self.database.get_manga_source_folder(
+                manga_id
+            )
+
+            if not folder:
+                continue
+
+            folder_path = Path(
+                folder
+            )
+
+            if (
+                not folder_path.exists()
+                or not folder_path.is_dir()
+            ):
+                continue
+
+            try:
+                imported, _, _ = import_new_chapter_folders(
+                    self.database,
+                    manga_id,
+                    folder,
+                    mark_new=True,
+                )
+
+                imported_total += imported
+
+            except Exception:
+                # No interrumpe el arranque por una carpeta dañada
+                # o un disco temporalmente no disponible.
+                continue
+
+        if imported_total:
+            self.refresh_library()
 
     def build_ui(self):
         central = QWidget()

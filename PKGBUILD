@@ -1,6 +1,6 @@
 pkgname=manga-reader-local
 pkgver=1.1.0
-pkgrel=3
+pkgrel=7
 pkgdesc="Lector local de manga con biblioteca, progreso y soporte PDF/CBZ/ZIP"
 arch=('any')
 url="https://github.com/ariel33322/Manga-Reader"
